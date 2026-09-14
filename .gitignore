@@ -1,0 +1,7 @@
+# 執行時產生的日誌與狀態檔(含 VM 名稱與重開紀錄),不進版控
+watch-vmhealth.log
+watch-vmhealth.state.json
+*.log
+*.state.json
+# 加密憑證檔
+*.cred
