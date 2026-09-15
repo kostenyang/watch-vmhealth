@@ -5,7 +5,8 @@
     判定「壞掉」的依據(VM 必須是 poweredOn 且 host 連線正常):
       1. VMware Tools 有裝,但 ToolsRunningStatus 不是 guestToolsRunning,或 GuestHeartbeatStatus 為 red/gray
          → guest 當機、或重開後卡在開機畫面起不來
-      2. (-Ping) guest IP ping 不通(IP 來自 Tools 回報,或 -PingMap 指定)
+      2. (-Ping / -TcpPort) guest IP ICMP 不通、且指定的 TCP port 都連不上
+         IP 來源:-PingMap 指定 > Tools 回報 > (-ResolveDns) 以 VM 名稱查 DNS
       3. (-PowerOnIfOff) VM 意外處於 poweredOff → 直接開機
     保護機制:
       * 開機後 -BootGraceMinutes 內不判定(給開機時間)
@@ -19,8 +20,11 @@
     # 常駐模式,每 60 秒檢查,連續 3 次失敗才硬重置;只監看貼了 AutoRestart 標籤的 VM
     pwsh ./Watch-VMHealth.ps1 -Server vc01.example.com -Credential $cred -Tag AutoRestart -Ping -Loop -IntervalSeconds 60
 .EXAMPLE
-    # 沒裝 Tools 的 VM 用 ping 判定
+    # 沒裝 Tools 的 VM:指定 IP 用 ping 判定
     pwsh ./Watch-VMHealth.ps1 -Server vc01.example.com -Credential $cred -VmName 'legacy01' -Ping -PingMap @{ legacy01 = '10.0.0.50' }
+.EXAMPLE
+    # 沒裝 Tools 的 VM:VM 名稱查 DNS 取 IP,改用 TCP port(SSH / RDP)判定,不怕 ICMP 被擋
+    pwsh ./Watch-VMHealth.ps1 -Server vc01.example.com -Credential $cred -Tag AutoRestart -ResolveDns -DnsSuffix example.com -TcpPort 22,3389 -Loop
 .NOTES
     需求:PowerShell 7.x + VMware.PowerCLI 13.x。
     vCenter 帳號最小權限:VirtualMachine.Interact.PowerOn / PowerOff / Reset、System.Read(唯讀+電源操作即可)。
@@ -40,7 +44,10 @@ param(
   [int]      $CooldownMinutes  = 30,          # 重開後多久內不再重開
   [int]      $MaxResetsPerDay  = 3,
   [switch]   $Ping,                           # 額外用 ICMP 判定
+  [int[]]    $TcpPort,                        # 額外用 TCP 連線判定(任一 port 通就算可達),例如 22,3389,443
   [hashtable]$PingMap    = @{},               # VM 名 → IP,沒 Tools 的 VM 用
+  [switch]   $ResolveDns,                     # 沒 Tools 也沒 PingMap 時,用 VM 名稱查 DNS 取 IP
+  [string]   $DnsSuffix,                      # -ResolveDns 時附加的網域,例如 example.com
   [switch]   $PowerOnIfOff,                   # poweredOff 也視為壞掉並開機
   [switch]   $Loop,
   [int]      $IntervalSeconds = 60,
@@ -66,6 +73,24 @@ function Save-State($s) { $s | ConvertTo-Json -Depth 5 | Set-Content $StatePath 
 function Get-VmState($s, $name) {
   if (-not $s.ContainsKey($name)) { $s[$name] = @{ fails = 0; lastReason = ''; resets = @() } }
   return $s[$name]
+}
+
+# ---------- 網路可達性 ----------
+function Resolve-VmIp($name) {
+  $fqdn = if ($DnsSuffix -and $name -notlike "*.$DnsSuffix") { "$name.$DnsSuffix" } else { $name }
+  try {
+    $a = [System.Net.Dns]::GetHostAddresses($fqdn) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+    if ($a) { return $a.IPAddressToString }
+  } catch {}
+  return $null
+}
+function Test-TcpPort($ip, $port, $timeoutMs = 2000) {
+  $c = [System.Net.Sockets.TcpClient]::new()
+  try {
+    $r = $c.ConnectAsync($ip, $port)
+    if ($r.Wait($timeoutMs) -and $c.Connected) { return $true }
+  } catch {} finally { $c.Dispose() }
+  return $false
 }
 
 # ---------- 健康判定 ----------
@@ -107,18 +132,33 @@ function Test-VmHealth($vm, $st) {
     elseif ($hb -in 'red','gray')  { $reasons += "heartbeat $hb" }
   }
 
-  $ip = $null
-  if ($Ping) {
+  # 網路可達性判定(-Ping ICMP / -TcpPort TCP 連線,任一通就算可達)
+  # 目標 IP 來源優先序:-PingMap 指定 > Tools 回報 > (-ResolveDns) 以 VM 名稱查 DNS
+  $ip = $null; $reachChecked = $false; $reach = $false
+  if ($Ping -or $TcpPort) {
     if ($PingMap.ContainsKey($vm.Name)) { $ip = $PingMap[$vm.Name] }
     elseif ($g.IpAddress -and $g.IpAddress -match '^\d+\.\d+\.\d+\.\d+$') { $ip = $g.IpAddress }
+    elseif ($ResolveDns) { $ip = Resolve-VmIp $vm.Name }
     if ($ip) {
-      $ok = Test-Connection -TargetName $ip -Count 2 -TimeoutSeconds 2 -Quiet -ErrorAction SilentlyContinue
-      if (-not $ok) { $reasons += "ping $ip 不通" }
+      $checks = @(); $reach = $false; $reachChecked = $true
+      if ($Ping) {
+        $ok = Test-Connection -TargetName $ip -Count 2 -TimeoutSeconds 2 -Quiet -ErrorAction SilentlyContinue
+        if ($ok) { $reach = $true } else { $checks += 'ping' }
+      }
+      if ($TcpPort -and -not $reach) {
+        foreach ($port in $TcpPort) { if (Test-TcpPort $ip $port) { $reach = $true; break } }
+        if (-not $reach) { $checks += "tcp $($TcpPort -join '/')" }
+      }
+      if (-not $reach) { $reasons += "$ip $($checks -join ' 與 ') 不通" }
     }
   }
+  # 網路可達 = guest 活著,優先於 Tools 判定。
+  # 實測:移除 Tools 後 vCenter 仍回報 toolsNotRunning / guestToolsUnmanaged(舊值殘留,不會變 toolsNotInstalled),
+  # 只看 Tools 會把「沒 Tools 但服務正常」的 VM 當成當機一直重開。
+  if ($reachChecked -and $reach) { return @{ Healthy = $true; ToolsAlive = $toolsAlive } }
 
   # 完全沒判定依據(沒 Tools 也沒 IP)→ 不敢動
-  if (-not $toolsInstalled -and -not $ip) { return @{ Skip = $true; Reason = '沒裝 Tools 也沒 ping 目標,無法判定' } }
+  if (-not $toolsInstalled -and -not $ip) { return @{ Skip = $true; Reason = '沒裝 Tools 也沒可達性目標(-PingMap / -ResolveDns),無法判定' } }
 
   if ($reasons.Count -eq 0) { return @{ Healthy = $true; ToolsAlive = $toolsAlive } }
   return @{ Healthy = $false; Reason = ($reasons -join '; '); ToolsAlive = $toolsAlive }
@@ -189,7 +229,7 @@ function Invoke-Check {
 
 Import-Module VMware.VimAutomation.Core | Out-Null
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -ParticipateInCEIP $false -Confirm:$false -Scope Session | Out-Null
-Log ("=== Watch-VMHealth 啟動 server={0} vm={1} tag={2} threshold={3} grace={4}m ping={5} dryrun={6} ===" -f $Server, ($VmName -join ','), ($Tag -join ','), $FailThreshold, $BootGraceMinutes, $Ping, $DryRun)
+Log ("=== Watch-VMHealth 啟動 server={0} vm={1} tag={2} threshold={3} grace={4}m ping={5} tcp={6} dns={7} dryrun={8} ===" -f $Server, ($VmName -join ','), ($Tag -join ','), $FailThreshold, $BootGraceMinutes, $Ping, ($TcpPort -join ','), $ResolveDns, $DryRun)
 if (-not $Credential) {
   if ($User -and $Password) { $Credential = [pscredential]::new($User, (ConvertTo-SecureString $Password -AsPlainText -Force)) }
   else { $Credential = Get-Credential -Message "vCenter $Server 帳號" }
